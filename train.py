@@ -8,71 +8,107 @@ from torch.utils.data import DataLoader
 from trainer import *
 from tester import *
 
-transform_train = transforms.Compose([
-    transforms.RandomCrop(32, padding=4),
+transform = transforms.Compose([
     transforms.RandomHorizontalFlip(),
+    transforms.RandomCrop(32, padding=4),
     transforms.ToTensor(),
-    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # データを正規化します
 ])
 
-transform_test = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-])
+train_dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+test_dataset = datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
 
-train_dataset = datasets.CIFAR100(root='./data', train=True, download=True, transform=transform_train)
-train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=4)
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
-test_dataset = datasets.CIFAR100(root='./data', train=False, download=True, transform=transform_test)
-test_loader = DataLoader(test_dataset, batch_size=100, shuffle=False, num_workers=4)
-
-teacher_model = models.resnet50(pretrained=True)
-student_model = models.resnet34(pretrained=True)
-
-optimizer = optim.SGD(student_model.parameters(), lr=0.001, momentum=0.9)
-criterion_kd = nn.KLDivLoss()
+teacher_model = models.resnet50(pretrained=False)
+num_ftrs = teacher_model.fc.in_features
+teacher_model.fc = nn.Linear(num_ftrs, 10)
+teacher_model2 = models.resnet50(pretrained=False)
+num_ftrs2 = teacher_model2.fc.in_features
+teacher_model2.fc = nn.Linear(num_ftrs2, 10)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+teacher_model = teacher_model.to(device)
+teacher_model2 = teacher_model2.to(device)
 
-teacher_model.to(device)
-student_model.to(device)
+student_model = models.resnet34(pretrained=False)
+num_ftrs = student_model.fc.in_features
+student_model.fc = nn.Linear(num_ftrs, 10)
+student_model = student_model.to(device)
 
-num_epochs = 10
-criterion_kd = nn.KLDivLoss()
+teacher_criterion = nn.CrossEntropyLoss()
+teacher_optimizer = optim.Adam(teacher_model.parameters(), lr=0.001)
+student_criterion = nn.CrossEntropyLoss()
+student_optimizer = optim.Adam(student_model.parameters(), lr=0.001)
 
-# 学習ループの実行
-for epoch in range(num_epochs):
+def train_teacher(epochs):
+    teacher_model.train()
+    for epoch in range(epochs):
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.to(device)
+            teacher_optimizer.zero_grad()
+            outputs = teacher_model(images)
+            loss = teacher_criterion(outputs, labels)
+            loss.backward()
+            teacher_optimizer.step()
+
+def train_student(epochs):
+    teacher_model.eval()
     student_model.train()
-    running_loss = 0.0
-    correct = 0
-    total = 0
+    for epoch in range(epochs):
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.to(device)
+            with torch.no_grad():
+                teacher_outputs = teacher_model(images)
+            student_optimizer.zero_grad()
+            outputs = student_model(images)
+            loss = knowledge_distillation_loss(outputs, labels, teacher_outputs)
+            loss.backward()
+            student_optimizer.step()
 
-    for inputs, targets in train_loader:
-        inputs, targets = inputs.to(device), targets.to(device)
-        optimizer.zero_grad()
+def knowledge_distillation_loss(outputs, labels, teacher_outputs, alpha=0.1):
+    # 知識蒸留の損失関数を定義します
+    student_loss = nn.CrossEntropyLoss()(outputs, labels)
+    teacher_loss = nn.MSELoss()(outputs, teacher_outputs)
+    return (1 - alpha) * student_loss + alpha * teacher_loss
 
-        # 生徒モデルの出力を計算
-        outputs_student = student_model(inputs)
+train_teacher(epochs=5)
+train_student(epochs=10)
 
-        # 教師モデルの出力を計算
-        with torch.no_grad():
-            outputs_teacher = teacher_model(inputs)
+# # 学習ループの実行
+# for epoch in range(num_epochs):
+#     student_model.train()
+#     running_loss = 0.0
+#     correct = 0
+#     total = 0
 
-        # KD損失を計算
-        outputs_student = outputs_student.float()  # 出力を浮動小数点数に変換
-        outputs_teacher = outputs_teacher.float()  # 出力を浮動小数点数に変換
-        loss_kd = criterion_kd(outputs_student, outputs_teacher)
+#     for inputs, targets in train_loader:
+#         inputs, targets = inputs.to(device), targets.to(device)
+#         optimizer.zero_grad()
 
-        loss_kd.backward()
-        optimizer.step()
+#         # 生徒モデルの出力を計算
+#         outputs_student = student_model(inputs)
 
-        running_loss += loss_kd.item() * inputs.size(0)
-        _, predicted = outputs_student.max(1)
-        total += targets.size(0)
-        correct += predicted.eq(targets).sum().item()
+#         # 教師モデルの出力を計算
+#         with torch.no_grad():
+#             outputs_teacher = teacher_model(inputs)
 
-    train_loss = running_loss / len(train_loader.dataset)
-    train_acc = correct / total
+#         # KD損失を計算
+#         outputs_student = outputs_student.float()  # 出力を浮動小数点数に変換
+#         outputs_teacher = outputs_teacher.float()  # 出力を浮動小数点数に変換
+#         loss_kd = criterion_kd(outputs_student, outputs_teacher)
 
-    print(f"Epoch {epoch+1}/{num_epochs}")
-    print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
+#         loss_kd.backward()
+#         optimizer.step()
+
+#         running_loss += loss_kd.item() * inputs.size(0)
+#         _, predicted = outputs_student.max(1)
+#         total += targets.size(0)
+#         correct += predicted.eq(targets).sum().item()
+
+#     train_loss = running_loss / len(train_loader.dataset)
+#     train_acc = correct / total
+
+#     print(f"Epoch {epoch+1}/{num_epochs}")
+#     print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
